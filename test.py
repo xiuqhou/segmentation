@@ -34,7 +34,7 @@ def main():
         dataset_test, batch_size=1, sampler=test_sampler
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CCNet(num_classes=dataset_test.NUM_CLASSES+1).to(device)
+    model = CCNet(num_classes=dataset_test.NUM_CLASSES).to(device)
     # TODO: load_from
     if args.restore_from:
         model.load_state_dict(torch.load(args.restore_from)['model'], strict=False)
@@ -42,14 +42,21 @@ def main():
     # TODO: 下面是evaluate方法的内容，考虑合并一下
     model.eval()
     pbar = tqdm(data_loader_test, file=sys.stdout, bar_format="{desc}{bar}[{elapsed}<{remaining},{rate_fmt}]")
-    confmat = ConfusionMatrix(dataset_test.NUM_CLASSES+1)
+    confmat = ConfusionMatrix(dataset_test.NUM_CLASSES)
     num_processed_samples = 0
-    output_list = list()
     print("Starting test ...")
     with torch.no_grad():
         for idx, (image, target) in enumerate(pbar):
             image, target = image.to(device), target.to(device)
             output = model(image)
+            # save results and visualization
+            output_im = output.argmax(1).cpu().numpy().squeeze().astype(np.uint8)
+            output_im = Image.fromarray(output_im)
+            output_im.putpalette(get_palette(dataset_test.NUM_CLASSES))
+            output_im = output_im.convert('L')
+            os.makedirs(args.save_dir, exist_ok=True)
+            output_im.save(os.path.join(args.save_dir, 
+                                        os.path.split(dataset_test.images[idx])[-1]))
             # output_list.append(output)
             confmat.update(target.flatten(), output.argmax(1).flatten())
             num_processed_samples += image.shape[0]
@@ -58,14 +65,6 @@ def main():
     print(f"Testing time {total_time_str}")
     print(confmat)
     # 设置颜色，保存mask
-    for idx, output in tqdm(enumerate(output_list)):
-        output = output.argmax(1).cpu().numpy().squeeze().astype(np.uint8)
-        output_im = Image.fromarray(output)
-        output_im.putpalette(get_palette(dataset_test.num_classes+1))
-        output_im = output_im.convert('L')
-        os.makedirs(args.save_dir, exist_ok=True)
-        output_im.save(os.path.join(args.save_dir, 
-                                    os.path.split(dataset_test.images[idx])[-1]))
 
 if __name__ == '__main__':
     main()
