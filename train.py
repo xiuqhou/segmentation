@@ -6,9 +6,9 @@ import numpy as np
 from torch.backends import cudnn
 from tqdm import tqdm
 from config import *
-from datasets.csd import CSDDataset
-from datasets.cityscapes import CityscapesDataset
+from datasets import CSDDataset, CityscapesDataset, CamvidDataset
 from models.ccnet import CCNet
+from models.pccnet import PCCNet
 from torchvision import transforms as T
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -54,14 +54,12 @@ def evaluate(model, data_loader, device, num_classes):
             num_processed_samples += image.shape[0]
     return confmat
 
-def train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, device, epoch, print_freq, scaler=None):
+def train_one_epoch(model, optimizer, data_loader, lr_scheduler, device, epoch, print_freq, scaler=None):
     model.train()
     pbar =  tqdm(data_loader, file=sys.stdout, bar_format="{desc}[{elapsed}<{remaining},{rate_fmt}]")
     for idx, (image, target) in enumerate(pbar):
         image, target = image.to(device), target.to(device)
-        output = model(image)
-        loss = criterion(output, target)
-
+        loss = model(image, target) # Integrate loss function into model when model.training is True
         optimizer.zero_grad()
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -92,8 +90,10 @@ def main():
     # 获取数据集
     # dataset = CSDDataset(dataset_root='datasets/CSD', mode='train', transforms=transforms)
     # dataset_test = CSDDataset(dataset_root='datasets/CSD', mode='test', transforms=ToTensorV2())
-    dataset = CityscapesDataset(dataset_root='datasets/cityscapes', mode='train', transforms=transforms)
-    dataset_test = CityscapesDataset(dataset_root='datasets/cityscapes', mode='val', transforms=ToTensorV2())
+    # dataset = CityscapesDataset(dataset_root='datasets/cityscapes', mode='train', transforms=transforms)
+    # dataset_test = CityscapesDataset(dataset_root='datasets/cityscapes', mode='val', transforms=ToTensorV2())
+    dataset = CamvidDataset(dataset_root='datasets/camvid', mode='train')
+    dataset_test = CamvidDataset(dataset_root='datasets/camvid', mode='test')
 
     cudnn.benchmark = True # 不知道有什么用
 
@@ -118,12 +118,17 @@ def main():
     )
     # 构建模型
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CCNet(num_classes=dataset.NUM_CLASSES+1).to(device) # categories + IGNORE_INDEX
+    model = CCNet(num_classes=dataset.NUM_CLASSES).to(device)
+    # NOTE: ccnet是预测NUM_CLASSES类别
     
     params_to_optimize = [
         {"params": [p for p in model.backbone.parameters() if p.requires_grad]},
         {"params": [p for p in model.classifier.parameters() if p.requires_grad]},
     ]
+    # set optimized parameters
+    # params_to_optimize = [{"params": [p for p in model.backbone.parameters() if p.requires_grad]}]
+    # for i in range(1, 5):
+    #     params_to_optimize.append({"params": [p for p in getattr(model, f'classifier{i}').parameters() if p.requires_grad]})
 
     optimizer = optim.SGD(params_to_optimize, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     
@@ -152,7 +157,7 @@ def main():
         lr_scheduler = main_lr_scheduler
 
     scaler = torch.cuda.amp.GradScaler() if args.amp else None
-    criterion = nn.CrossEntropyLoss(ignore_index=255)
+    # criterion = nn.CrossEntropyLoss(ignore_index=255)
 
     if args.restore_from:
         checkpoint = torch.load(args.restore_from)
@@ -169,8 +174,8 @@ def main():
 
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
-        train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, device, epoch, args.print_freq)
-        confmat = evaluate(model, data_loader_test, device=device, num_classes=dataset.NUM_CLASSES+1)
+        train_one_epoch(model, optimizer, data_loader, lr_scheduler, device, epoch, args.print_freq)
+        confmat = evaluate(model, data_loader_test, device=device, num_classes=dataset.NUM_CLASSES)
         print(confmat)
         checkpoint = {
             "model": model.state_dict(),
@@ -181,89 +186,14 @@ def main():
         }
         if args.amp:
             checkpoint["scaler"] = scaler.state_dict()
-        print(f"Saving checkpoint into {args.output_dir}")
-        os.makedirs(args.output_dir, exist_ok=True)
-        torch.save(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
-        torch.save(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
+        # print(f"Saving checkpoint into {args.output_dir}")
+        # os.makedirs(args.output_dir, exist_ok=True)
+        # torch.save(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
+        # torch.save(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
     
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print(f"Training time {total_time_str}")
-    
-
-
-
-
-    with Engine(custom_parser=parser) as engine:
-        # model = Res_Deeplab(args.num_classes, criterion=criterion,
-        #         pretrained_model=args.restore_from)
-        seg_model = eval('networks.' + args.model + '.Seg_Model')(
-            num_classes=args.num_classes, criterion=criterion,
-            pretrained_model=args.restore_from, recurrence=args.recurrence
-        )
-        # seg_model.init_weights()
-
-        # group weight and config optimizer
-        optimizer = optim.SGD([{'params': filter(lambda p: p.requires_grad, seg_model.parameters()), 'lr': args.learning_rate}], 
-                lr=args.learning_rate, momentum=args.momentum, weight_decay=args.weight_decay)
-        optimizer.zero_grad()
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        seg_model.to(device)
-
-        model = engine.data_parallel(seg_model)
-        model.train()
-
-        if not os.path.exists(args.snapshot_dir):
-            os.makedirs(args.snapshot_dir)
-            
-        run = True
-        global_iteration = args.start_iters
-        avgloss = 0
-
-        while run:
-            epoch = global_iteration // len(train_loader)
-            if engine.distributed:
-                train_sampler.set_epoch(epoch)
-
-            bar_format = '{desc}[{elapsed}<{remaining},{rate_fmt}]'
-            pbar = tqdm(range(len(train_loader)), file=sys.stdout,
-                        bar_format=bar_format)
-            dataloader = iter(train_loader)
-
-            for idx in pbar:
-                global_iteration += 1
-
-                images, labels, _, _ = dataloader.next()
-                images = images.cuda(non_blocking=True)
-                labels = labels.long().cuda(non_blocking=True)
-
-                optimizer.zero_grad()
-                lr = adjust_learning_rate(optimizer, args.learning_rate, global_iteration-1, args.num_steps, args.power)
-                loss = model(images, labels)
-
-                reduce_loss = engine.all_reduce_tensor(loss)
-                loss.backward()
-                optimizer.step()
-
-
-                print_str = 'Epoch{}/Iters{}'.format(epoch, global_iteration) \
-                        + ' Iter{}/{}:'.format(idx + 1, len(train_loader)) \
-                        + ' lr=%.2e' % lr \
-                        + ' loss=%.2f' % reduce_loss.item()
-
-                pbar.set_description(print_str, refresh=False)
-                # 如果在主机上且到达checkpoint点，则保存结果
-                if (not engine.distributed) or (engine.distributed and engine.local_rank == 0):
-                    if global_iteration % args.save_pred_every == 0 or global_iteration >= args.num_steps:
-                        print('taking snapshot ...')
-                        torch.save(seg_model.state_dict(),osp.join(args.snapshot_dir, 'CS_scenes_'+str(global_iteration)+'.pth')) 
-
-                if global_iteration >= args.num_steps:
-                    run = False
-                    break    
-
-
 
 if __name__ == '__main__':
     main()
